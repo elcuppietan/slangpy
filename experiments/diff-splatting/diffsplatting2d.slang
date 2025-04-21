@@ -58,29 +58,17 @@ groupshared uint blobCount;
 // The blobs buffer is used to store the indices of the blobs that intersect
 // with the current tile.
 //
-groupshared uint blobs[GAUSSIANS_PER_BLOCK];
+// Reduce to 16bit to conserve group shared memory
+groupshared uint16_t blobs[GAUSSIANS_PER_BLOCK];
 
 // The maxCount and finalVal buffers are used to store the final PixelState objects
 // after the forward pass. This data is read-back for the backwards pass.
 //
-groupshared uint maxCount[WG_X * WG_Y];
+// Reduce int to 16bit to conserve group shared memory
+groupshared uint16_t maxCount[WG_X * WG_Y];
 groupshared float4 finalVal[WG_X * WG_Y];
 
-// The reductionBuffer is used for the binary reduction in the loadFloat_bwd() function.
-groupshared float reductionBuffer[WG_X * WG_Y];
-
 // -----------------------------------------
-
-// Some types to hold state info on the 'blobs' buffer.
-// This makes it easy to make sure we're not accidentally using the buffer
-// in the wrong state.
-//
-// The actual data is in the 'blobs' object.
-//
-struct InitializedShortList { int _dummy = 0; };
-struct FilledShortList { int _dummy = 0; };
-struct PaddedShortList { int _dummy = 0; };
-struct SortedShortList { int _dummy = 0; };
 
 struct Blobs
 {
@@ -238,14 +226,15 @@ struct PixelState : IDifferentiable
  *
  */
 [Differentiable]
-PixelState transformPixelState(PixelState pixel, float4 gval)
+PixelState transformPixelState(PixelState pixel, float4 gval, uint blobIdx)
 {
     var newState = alphaBlend(pixel.value, gval);
 
     if (pixel.value.a < 1.f / 255.f)
         return { pixel.value, pixel.finalCount };
 
-    return { newState, pixel.finalCount + 1 };
+    //return { newState, pixel.finalCount + 1 };
+    return { newState, blobIdx }
 }
 
 /*
@@ -483,22 +472,28 @@ float4 eval(Blobs blobs, uint blob_id, no_diff float2 uv, uint localIdx)
 }
 
 /*
- * fineRasterize() produces the per-pixel final color from a sorted list of blobs that overlap the current tile.
+ * cullAndApplyBlobs finds blobs which intersect the current tile and evaluates them in a single pass using
+ * wave intrinsics.
  *
- * The fine rasterizeration is where the calculation of the per-pixel color happens.
  * This uses the multiplicative alpha blending algorithm laid out in the original GS paper (https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/)
  * This is represented as a 'state transition' (transformPixelState) as we go through the blobs in order, so that we can
- * concisely represent the 'state undo' operation in the backwards pass.
+ * concisely represent the 'state undo' operation in the custom backwards pass (fineRasterize_bwd).
  *
  * In Slang, custom derivative functions can be defiened using the `[BackwardDerivative(custom_fn)]` attribute.
  */
 [BackwardDerivative(fineRasterize_bwd)]
-float4 fineRasterize(SortedShortList, Blobs blobset, uint localIdx, no_diff float2 uv)
+float4 cullAndApplyBlobs(Blobs blobs, OBB tileBounds, uint localIdx, no_diff float2 uv)
 {
-    GroupMemoryBarrierWithGroupSync();
-
     PixelState pixelState = PixelState(float4(0, 0, 0, 1), 0);
-    uint count = blobCount;
+    uint numIntersectingBlobs = 0;
+    
+    // Traverse the list in workgroup-sized chunks. Each lane in the workgroup/wave will be responsible for
+    // determining if one gaussian in the chunk intersects the current tile.
+    for (uint wgStart = 0, numGaussians = Gaussian2D.count(blobs); wgStart < numGaussians; wgStart += WG_SIZE)
+    {
+
+    }
+
     // The forward rasterization
     for (uint i = 0; i < count; i++)
         pixelState = transformPixelState(pixelState, eval(blobset, blobs[i], uv, localIdx));
@@ -617,20 +612,11 @@ float2 calcUV(uint2 dispatchThreadID, int2 renderSize, int2 imageSize)
 
 /*
  * splatBlobs() is the main rendering routine that computes a final color for the pixel.
- *
- * It proceeds in 4 stages:
- *  1. Coarse rasterization: Short-list blobs that intersect with the current tile through
- *                           bounding-box intersection tests.
- *  2. Padding: Fill the unused space in the buffer with a sentinel value.
- *  3. Sorting: Sort the short list of blobs.
- *  4. Fine rasterization: Calculate the final color for the pixel.
- *
- * Note that only the final stage is differentiable since it is the only stage that produces
- * the final color.
- * The other stages are just optimizations to reduce the blobs under consideration.
- *
- * The produced derivative function will re-use the same optimizations as-is.
- *
+ * 
+ * This function will use a single pass to cull the full blob list to only the ones instersecting
+ * with the current workgroup tile, and evaluate them. This avoids having to re-sort the list.
+ * This is accomplished by using WaveActiveBallot to allow the entire subgroup to see the result
+ * of the intersection test for each lane in the wave.
  */
 [Differentiable]
 float4 splatBlobs(GradInOutTensor<float, 1> blobsBuffer, uint2 dispatchThreadID, int2 dispatchSize, int2 texSize)
@@ -638,7 +624,7 @@ float4 splatBlobs(GradInOutTensor<float, 1> blobsBuffer, uint2 dispatchThreadID,
     Blobs blobs = {blobsBuffer};
 
     // Calculate effective uv coordinate for the current pixel. This is used for
-    // evaluating the 2D Daussians.
+    // evaluating the 2D Gaussians.
     float2 uv = no_diff calcUV(dispatchThreadID, dispatchSize, texSize);
 
     //
@@ -656,33 +642,12 @@ float4 splatBlobs(GradInOutTensor<float, 1> blobsBuffer, uint2 dispatchThreadID,
 
     OBB tileBounds = OBB(tileCenter, tileRotation, tileScale);
 
-    // -------------------------------------------------------------------
+    uint localIdx = WaveGetLaneIndex(); // identify the specific lane within the workgroup --
+                                        // this will be used to correctly identify intersected
+                                        // blobs
 
-    // Main rendering steps..
-
-    // Initialize the short list (by resetting counters)
-    InitializedShortList sList = initShortList(dispatchThreadID);
-
-    uint2 localID = dispatchThreadID % uint2(WG_X, WG_Y);
-    uint localIdx = localID.x + localID.y * WG_X;
-
-    // Short-list blobs that overlap with the local tile.
-    FilledShortList filledSList = coarseRasterize(sList, blobs, tileBounds, localIdx);
-
-    // Pad the unused space in the buffer
-    PaddedShortList paddedSList = padBuffer(filledSList, localIdx);
-
-    // Sort the short list
-    SortedShortList sortedList = bitonicSort(paddedSList, localIdx);
-
-    // Perform per-pixel fine rasterization
-    float4 color = fineRasterize(sortedList, blobs, localIdx, uv);
-
-    // Blend with background
-    return float4(color.rgb * (1.0 - color.a) + color.a, 1.0);
-
-    //return float4(uv.x, uv.y, 1.0, 1.0f);
-    //return float4(dispatchThreadID.x/(float)dispatchSize.x, dispatchThreadID.y/(float)dispatchSize.y, 1.0, 1.0);
+    float color = cullAndApplyBlobs(blobs, tileBounds, localIdx, uv);
+    return float4(color.rgb * (1.0 - color.a) + color.add, 1.0);
 }
 
 void renderBlobsToTexture(
