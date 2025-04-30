@@ -30,6 +30,7 @@ import slangpy;
 static const int GAUSSIANS_PER_BLOCK = 512;
 static const int WG_X = 8;
 static const int WG_Y = 4;
+static const int WG_SIZE = WG_X * WG_Y;
 
 static const float ADAM_ETA = 0.002;
 static const float ADAM_BETA_1 = 0.9;
@@ -41,25 +42,13 @@ static const float ADAM_EPSILON = 1e-8;
 // Note: In Slang, the 'groupshared' identifier is used to define
 // workgroup-level shared memory. This is equivalent to '__shared__' in CUDA
 
-// blobCountAT is used when storing blob IDs into the blobs buffer. It needs to be atomic
-// since multiple threads will be in contention to increment it.
-//
-// Atomic<T> is the most portable way to express atomic operations. Slang supports basic
-// operations like +, -, ++, etc.. on Atomic<T> types.
-//
-groupshared Atomic<uint> blobCountAT;
-
-// This is used after the coarse rasterization step as a non-atomic
-// location to store the blob count, since atomics are not necessary after the coarse
-// rasterization step.
-//
-groupshared uint blobCount;
+groupshared uint intersectingBlobCount;
 
 // The blobs buffer is used to store the indices of the blobs that intersect
 // with the current tile.
 //
 // Reduce to 16bit to conserve group shared memory
-groupshared uint16_t blobs[GAUSSIANS_PER_BLOCK];
+groupshared uint16_t intersectingBlobList[GAUSSIANS_PER_BLOCK];
 
 // The maxCount and finalVal buffers are used to store the final PixelState objects
 // after the forward pass. This data is read-back for the backwards pass.
@@ -234,7 +223,7 @@ PixelState transformPixelState(PixelState pixel, float4 gval, uint blobIdx)
         return { pixel.value, pixel.finalCount };
 
     //return { newState, pixel.finalCount + 1 };
-    return { newState, blobIdx }
+    return { newState, blobIdx };
 }
 
 /*
@@ -271,7 +260,7 @@ struct Gaussian2D : IDifferentiable
     float opacity;
 
     [Differentiable]
-    static Gaussian2D load(Blobs blobs, uint idx, uint localIdx)
+    static Gaussian2D load(Blobs blobs, uint idx)
     {
         uint total = Gaussian2D.count(blobs);
         Gaussian2D gaussian;
@@ -367,107 +356,10 @@ struct Gaussian2D : IDifferentiable
     }
 };
 
-/*
- * padBuffer() is a helper method that fills the unused space in the buffer with a sentinel value (uint::maxValue).
- * This is just because bitonicSort requires all elements to have a valid value. padBuffer filles these in with
- * maxValue, which are effectively pushed to the end of the list.
- */
-PaddedShortList padBuffer(FilledShortList, uint localIdx)
-{
-    GroupMemoryBarrierWithGroupSync();
-
-    var maxN = blobCount;
-    for (uint i = localIdx; i < GAUSSIANS_PER_BLOCK; i += (WG_X * WG_Y))
-    {
-        if (i >= maxN)
-            blobs[i] = uint::maxValue;
-    }
-
-    return { 0 };
-}
-
-/*
- * bitonicSort() implements a workgroup-level parallel sorting algorithm to sort indices in the short-list.
- * Requires all elements in the buffer to be valid (invalid elements should be set to infinity, or its equivalent).
- *
- * Bitonic sorting is an efficient, deterministic, parallel sorting algorithm particularly well-suited for GPUs.
- * At a high-level, it operates by comparing & swapping elements in parallel in (logN)^2 stages.
- *
- * More info on the bitonic sort algorithm: https://en.wikipedia.org/wiki/Bitonic_sorter
- * The code was adapted from the Wikipedia sample pseudocode here: https://en.wikipedia.org/wiki/Bitonic_sorter#Example_code
- *
- */
-SortedShortList bitonicSort(PaddedShortList, uint localIdx)
-{
-    GroupMemoryBarrierWithGroupSync();
-
-    uint maxN = blobCount;
-    for (uint k = 2; k <= GAUSSIANS_PER_BLOCK; k *= 2)
-    {
-        for (uint j = k / 2; j > 0; j /= 2)
-        {
-            for (uint i = localIdx; i < GAUSSIANS_PER_BLOCK; i += WG_X * WG_Y)
-            {
-                uint l = i ^ j;
-                if (l > i)
-                {
-                    if ((((i & k) == 0) && (blobs[i] > blobs[l])) ||
-                        (((i & k) != 0) && (blobs[i] < blobs[l])))
-                    {
-                        // Swap
-                        var temp = blobs[i];
-                        blobs[i] = blobs[l];
-                        blobs[l] = temp;
-                    }
-                }
-            }
-
-            GroupMemoryBarrierWithGroupSync();
-        }
-    }
-
-    return { 0 };
-}
-
-/*
- * coarseRasterize() calculates a subset of blobs that intersect with the current tile. Expects the blob counters to be reset before calling.
- *
- * The coarse rasterization step determines a subset of blobs that intersect with the tile.
- * Each thread in the workgroup takes a subset of blobs and uses bounding-box intersection tests to determine
- * if the tile associated with this workgroup overlaps with the blob's bounds.
- *
- * Note: This is a simplistic implementation, so there is a limit to the number of blobs in the short-list (NUM_GAUSSIANS_PER_BLOCK).
- * In practice, if the number of blobs per tile exceeds this, NUM_GAUSSIANS_PER_BLOCK must be increased manually.
- * A more sophisticated implementation would perform multiple passes to handle this case.
- *
- */
-FilledShortList coarseRasterize(InitializedShortList sList, Blobs blobset, OBB tileBounds, uint localIdx)
-{
-    GroupMemoryBarrierWithGroupSync();
-
-    Gaussian2D gaussian;
-    uint numGaussians = Gaussian2D.count(blobset);
-    for (uint i = localIdx; i < numGaussians; i += (WG_X * WG_Y))
-    {
-        gaussian = Gaussian2D.load(blobset, i, localIdx);
-        OBB bounds = gaussian.bounds();
-        if (bounds.intersects(tileBounds))
-        {
-            blobs[blobCountAT++] = i;
-        }
-    }
-
-    GroupMemoryBarrierWithGroupSync();
-
-    blobCount = blobCountAT.load();
-
-    return { 0 };
-}
-
 [Differentiable]
-float4 eval(Blobs blobs, uint blob_id, no_diff float2 uv, uint localIdx)
+float4 eval(Blobs blobs, uint blob_id, no_diff float2 uv)
 {
-    Gaussian2D gaussian = Gaussian2D.load(blobs, blob_id, localIdx);
+    Gaussian2D gaussian = Gaussian2D.load(blobs, blob_id);
     return gaussian.eval(uv);
 }
 
@@ -491,13 +383,37 @@ float4 cullAndApplyBlobs(Blobs blobs, OBB tileBounds, uint localIdx, no_diff flo
     // determining if one gaussian in the chunk intersects the current tile.
     for (uint wgStart = 0, numGaussians = Gaussian2D.count(blobs); wgStart < numGaussians; wgStart += WG_SIZE)
     {
+        // lane 0 will load the blob represented at position wgStart, and other lanes will get the subsequent blobs
+        Gaussian2D coarseBlob = Gaussian2D.load(blobs, wgStart + localIdx);
+        bool intersects = coarseBlob.bounds().intersects(tileBounds);
 
+        // All lanes write to the ballot bitmask to indicate whether intersection is true;
+        // so all lanes will have the same value for intersectionMask
+        uint intersectionMask = WaveActiveBallot(intersects).x;
+
+        while(intersectionMask != 0)
+        {
+            // identify the next lane with intersects == true in this chunk
+            uint idxInChunk = firstbitlow(intersectionMask);
+            uint blobIdx = wgStart + idxInChunk; // then get the index for that blob
+         
+            intersectionMask &= intersectionMask - 1; // remove the least significant 1 bit from the mask
+
+            float4 blobEval = eval(blobs, blobIdx, uv);
+            pixelState = transformPixelState(pixelState, blobEval, blobIdx);
+
+            intersectingBlobList[min(numIntersectingBlobs++, GAUSSIANS_PER_BLOCK - 1)] = blobIdx;
+        }
+
+        // if ALL the blobs processed in this chunk are below the alpha threshold,
+        // stop processing blobs.
+        if (WaveActiveAllTrue(pixelState.value.a < 1.f / 255.f))
+        {
+            break;
+        }
     }
 
-    // The forward rasterization
-    for (uint i = 0; i < count; i++)
-        pixelState = transformPixelState(pixelState, eval(blobset, blobs[i], uv, localIdx));
-
+    intersectingBlobCount = numIntersectingBlobs;
     maxCount[localIdx] = pixelState.finalCount;
     finalVal[localIdx] = pixelState.value;
     return pixelState.value;
@@ -517,7 +433,7 @@ float4 cullAndApplyBlobs(Blobs blobs, OBB tileBounds, uint localIdx, no_diff flo
  *
  * The loop body therefore invokes `bwd_diff` to backprop the derivatives via auto-diff.
  */
-void fineRasterize_bwd(SortedShortList, Blobs blobset, uint localIdx, float2 uv, float4 dOut)
+void fineRasterize_bwd(Blobs blobset, OBB tileBounds, uint localIdx, float2 uv, float4 dOut)
 {
     GroupMemoryBarrierWithGroupSync();
 
@@ -534,11 +450,11 @@ void fineRasterize_bwd(SortedShortList, Blobs blobset, uint localIdx, float2 uv,
     // The inner loop body still uses auto-diff, so the bulk of the computation is still
     // handled by the auto-diff engine.
     //
-    for (uint _i = blobCount; _i > 0; _i--)
+    for (uint _i = intersectingBlobCount; _i > 0; _i--)
     {
         uint i = _i - 1;
-        var blobID = blobs[i];
-        var gval = eval(blobset, blobID, uv, localIdx);
+        var blobID = intersectingBlobList[i];
+        var gval = eval(blobset, blobID, uv);
         var prevState = undoPixelState(pixelState, i + 1, gval);
 
         var dpState = diffPair(prevState);
@@ -548,25 +464,12 @@ void fineRasterize_bwd(SortedShortList, Blobs blobset, uint localIdx, float2 uv,
         // the loop body. Note that the `bwd_diff` calls writeback the differentials to dpState and dpGVal,
         // and can be obtained via `getDifferential()` (or simply '.d')
         //
-        bwd_diff(transformPixelState)(dpState, dpGVal, dColor);
-        bwd_diff(eval)(blobset, blobID, uv, localIdx, dpGVal.getDifferential());
+        bwd_diff(transformPixelState)(dpState, dpGVal, blobID, dColor);
+        bwd_diff(eval)(blobset, blobID, uv, dpGVal.getDifferential());
 
         pixelState = prevState;
         dColor = dpState.getDifferential();
     }
-}
-
-InitializedShortList initShortList(uint2 dispatchThreadID)
-{
-    GroupMemoryBarrierWithGroupSync();
-
-    if (dispatchThreadID.x % WG_X == 0 && dispatchThreadID.y % WG_Y == 0)
-    {
-        blobCount = 0;
-        blobCountAT = 0;
-    }
-
-    return { 0 };
 }
 
 /*
@@ -646,8 +549,8 @@ float4 splatBlobs(GradInOutTensor<float, 1> blobsBuffer, uint2 dispatchThreadID,
                                         // this will be used to correctly identify intersected
                                         // blobs
 
-    float color = cullAndApplyBlobs(blobs, tileBounds, localIdx, uv);
-    return float4(color.rgb * (1.0 - color.a) + color.add, 1.0);
+    float4 color = cullAndApplyBlobs(blobs, tileBounds, localIdx, uv);
+    return float4(color.rgb * (1.0 - color.a) + color.a, 1.0);
 }
 
 void renderBlobsToTexture(
